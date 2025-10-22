@@ -71,11 +71,11 @@
   }
 
   function makeTileCacheKey(tileID) {
-    const canonical = tileID.canonical;
-    return `${tileID.overscaledZ}:${tileID.wrap}:${canonical.z}:${canonical.x}:${canonical.y}`;
+    if (!tileID) return "";
+    return tileID.key;
   }
 
-  function getNeighborKey(tileID, dx, dy) {
+  function getNeighborTileID(tileID, dx, dy) {
     const canonical = tileID.canonical;
     const dim = Math.pow(2, canonical.z);
     let nx = canonical.x + dx;
@@ -92,7 +92,32 @@
       wrap += 1;
     }
 
-    return `${tileID.overscaledZ}:${wrap}:${canonical.z}:${nx}:${ny}`;
+    if (!maplibregl || !maplibregl.OverscaledTileID) return null;
+
+    return new maplibregl.OverscaledTileID(tileID.overscaledZ, wrap, canonical.z, nx, ny);
+  }
+
+  function tryPopulateDEMEntry(tileID) {
+    if (!mapInstance || !tileID) return;
+    const key = makeTileCacheKey(tileID);
+    if (terrainDEMCache.has(key)) return;
+
+    const terrain = mapInstance.terrain;
+    const sourceCache = terrain && terrain.sourceCache;
+    if (!sourceCache || !sourceCache.getSourceTile) return;
+
+    const demTile = sourceCache.getSourceTile(tileID, true);
+    if (!demTile || !demTile.dem) return;
+
+    terrainDEMCache.set(key, {
+      dem: demTile.dem,
+      tileID: demTile.tileID,
+      updated: Date.now(),
+      lastUsed: Date.now()
+    });
+    if (mapInstance && mapInstance.getLayer && mapInstance.getLayer('terrain-normal')) {
+      terrainNormalLayer.refreshTextureForKey(key);
+    }
   }
   
   // Define the custom terrain layer.
@@ -229,6 +254,7 @@
       if (!textureEntry) {
         textureEntry = this.createTextureFromDEM(demEntry);
         if (textureEntry) {
+          textureEntry.lastUsedFrame = this.frameCount;
           this.textureCache.set(key, textureEntry);
         }
       } else {
@@ -240,21 +266,29 @@
         textureEntry.tileID = demEntry.tileID;
         textureEntry.width = pixels.width;
         textureEntry.height = pixels.height;
+        textureEntry.lastUsedFrame = this.frameCount;
       }
     },
 
-    ensureTextureForKey(key) {
-      if (!key) return null;
+    ensureTextureForTile(tileID) {
+      if (!tileID) return null;
+      const key = makeTileCacheKey(tileID);
+      tryPopulateDEMEntry(tileID);
+
+      const demEntry = terrainDEMCache.get(key);
+      if (!demEntry) return null;
+
       let textureEntry = this.textureCache.get(key);
       if (!textureEntry) {
         this.refreshTextureForKey(key);
         textureEntry = this.textureCache.get(key);
       }
+
       if (textureEntry) {
         textureEntry.lastUsedFrame = this.frameCount;
-        const demEntry = terrainDEMCache.get(key);
-        if (demEntry) demEntry.lastUsed = Date.now();
+        demEntry.lastUsed = Date.now();
       }
+
       return textureEntry;
     },
 
@@ -301,9 +335,44 @@
 
       for (const tileID of tileIDs) {
         const key = makeTileCacheKey(tileID);
-        const centerTexture = this.ensureTextureForKey(key);
+        const centerTexture = this.ensureTextureForTile(tileID);
         if (!centerTexture) {
           if (DEBUG) console.log(`Skipping tile ${key}: no DEM texture available`);
+          skippedCount++;
+          continue;
+        }
+
+        const neighborOffsets = [
+          {dx: -1, dy: 0, uniform: 'u_image_left'},
+          {dx: 1, dy: 0, uniform: 'u_image_right'},
+          {dx: 0, dy: -1, uniform: 'u_image_top'},
+          {dx: 0, dy: 1, uniform: 'u_image_bottom'},
+          {dx: -1, dy: -1, uniform: 'u_image_topLeft'},
+          {dx: 1, dy: -1, uniform: 'u_image_topRight'},
+          {dx: -1, dy: 1, uniform: 'u_image_bottomLeft'},
+          {dx: 1, dy: 1, uniform: 'u_image_bottomRight'}
+        ];
+
+        const neighborTextures = {};
+        let missingNeighbor = false;
+
+        for (const neighbor of neighborOffsets) {
+          const neighborTileID = getNeighborTileID(tileID, neighbor.dx, neighbor.dy);
+          if (!neighborTileID) {
+            missingNeighbor = true;
+            break;
+          }
+
+          const texture = this.ensureTextureForTile(neighborTileID);
+          if (!texture) {
+            missingNeighbor = true;
+            break;
+          }
+          neighborTextures[neighbor.uniform] = texture;
+        }
+
+        if (missingNeighbor) {
+          if (DEBUG) console.log(`Skipping tile ${key}: missing neighbor DEM textures`);
           skippedCount++;
           continue;
         }
@@ -315,17 +384,6 @@
         gl.enableVertexAttribArray(shader.attributes.a_pos);
         gl.vertexAttribPointer(shader.attributes.a_pos, 2, gl.SHORT, false, 4, 0);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
-
-        const neighborTextures = {
-          u_image_left: this.ensureTextureForKey(getNeighborKey(tileID, -1, 0)) || centerTexture,
-          u_image_right: this.ensureTextureForKey(getNeighborKey(tileID, 1, 0)) || centerTexture,
-          u_image_top: this.ensureTextureForKey(getNeighborKey(tileID, 0, -1)) || centerTexture,
-          u_image_bottom: this.ensureTextureForKey(getNeighborKey(tileID, 0, 1)) || centerTexture,
-          u_image_topLeft: this.ensureTextureForKey(getNeighborKey(tileID, -1, -1)) || centerTexture,
-          u_image_topRight: this.ensureTextureForKey(getNeighborKey(tileID, 1, -1)) || centerTexture,
-          u_image_bottomLeft: this.ensureTextureForKey(getNeighborKey(tileID, -1, 1)) || centerTexture,
-          u_image_bottomRight: this.ensureTextureForKey(getNeighborKey(tileID, 1, 1)) || centerTexture
-        };
 
         bindTexture(centerTexture, 0, 'u_image');
         bindTexture(neighborTextures.u_image_left, 1, 'u_image_left');
@@ -411,7 +469,16 @@
       gl.useProgram(shader.program);
 
       const tileIDs = this.map.coveringTiles({ tileSize: TILE_SIZE, maxzoom: DEM_MAX_ZOOM });
-      if (tileIDs.length === 0) {
+      const uniqueTiles = [];
+      const seen = new Set();
+      for (const tileID of tileIDs) {
+        const key = tileID && tileID.key;
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        uniqueTiles.push(tileID);
+      }
+      const renderableTiles = uniqueTiles;
+      if (renderableTiles.length === 0) {
         if (DEBUG) console.log("No covering tiles available");
         this.map.triggerRepaint();
         return;
@@ -425,7 +492,7 @@
         gl.depthFunc(gl.LESS);
         gl.colorMask(false, false, false, false);
         gl.clear(gl.DEPTH_BUFFER_BIT);
-        this.renderTiles(gl, shader, tileIDs, options);
+        this.renderTiles(gl, shader, renderableTiles, options);
 
         gl.colorMask(true, true, true, true);
         gl.depthFunc(gl.LEQUAL);
@@ -436,7 +503,7 @@
           gl.ONE,
           gl.ONE_MINUS_SRC_ALPHA
         );
-        this.renderTiles(gl, shader, tileIDs, options);
+        this.renderTiles(gl, shader, renderableTiles, options);
       } else {
         gl.depthFunc(gl.LEQUAL);
         gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -446,7 +513,7 @@
           gl.enable(gl.BLEND);
           gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
         }
-        this.renderTiles(gl, shader, tileIDs, options);
+        this.renderTiles(gl, shader, renderableTiles, options);
       }
 
       gl.disable(gl.BLEND);
