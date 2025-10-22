@@ -94,6 +94,29 @@
 
     return `${tileID.overscaledZ}:${wrap}:${canonical.z}:${nx}:${ny}`;
   }
+
+  function tryPopulateDEMEntry(tileID) {
+    if (!mapInstance || !tileID) return;
+    const key = makeTileCacheKey(tileID);
+    if (terrainDEMCache.has(key)) return;
+
+    const terrain = mapInstance.terrain;
+    const sourceCache = terrain && terrain.sourceCache;
+    if (!sourceCache || !sourceCache.getSourceTile) return;
+
+    const demTile = sourceCache.getSourceTile(tileID, true);
+    if (!demTile || !demTile.dem) return;
+
+    terrainDEMCache.set(key, {
+      dem: demTile.dem,
+      tileID: demTile.tileID,
+      updated: Date.now(),
+      lastUsed: Date.now()
+    });
+    if (mapInstance && mapInstance.getLayer && mapInstance.getLayer('terrain-normal')) {
+      terrainNormalLayer.refreshTextureForKey(key);
+    }
+  }
   
   // Define the custom terrain layer.
   const terrainNormalLayer = {
@@ -301,6 +324,7 @@
 
       for (const tileID of tileIDs) {
         const key = makeTileCacheKey(tileID);
+        tryPopulateDEMEntry(tileID);
         const centerTexture = this.ensureTextureForKey(key);
         if (!centerTexture) {
           if (DEBUG) console.log(`Skipping tile ${key}: no DEM texture available`);
